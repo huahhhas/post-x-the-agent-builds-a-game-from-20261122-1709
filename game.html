@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Star Catcher — catch the falling stars</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0b0714; height: 100%; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; width: min(100vw, 56.25vh); height: min(100vh, 177.78vw);
+           background: #0b0714; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="game" width="540" height="960"></canvas>
+<script>
+'use strict';
+/*
+ * STAR CATCHER — a tiny browser game built from one prompt:
+ * "Build a tiny browser game where you catch falling stars in a basket you
+ *  move with the arrow keys — 60 seconds on the clock, +1 per star, 3 misses
+ *  and it's over."
+ *
+ * Play: ArrowLeft / ArrowRight (or A / D), mouse, or touch drag to move the
+ * basket. Catch falling stars for +1. A star that hits the ground costs a
+ * life. 3 lives, 60 seconds. R restarts.
+ *
+ * Demo mode (?demo=1&t=<seconds>): renders the deterministic state of an
+ * autoplayed game at time t, so the game can be captured frame by frame.
+ * Same code, same rules — the basket just plays itself. The demo simulation
+ * is seeded (mulberry32, fixed seeds), so the same t always renders the
+ * same frame.
+ */
+
+// --- deterministic RNG (mulberry32) ---------------------------------------
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// --- constants --------------------------------------------------------------
+const W = 540, H = 960;
+const GROUND_Y = 880;
+const BASKET_Y = 830;
+const BASKET_W = 110, BASKET_H = 34;
+const GAME_LEN = 60;          // seconds
+const START_LIVES = 3;
+const SPAWN_EVERY = 0.65;     // seconds between stars
+const STAR_R = 16;
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// --- background stars (fixed, seeded) ---------------------------------------
+const bgStars = [];
+{
+  const rng = mulberry32(20261122);
+  for (let i = 0; i < 90; i++) {
+    bgStars.push({ x: rng() * W, y: rng() * GROUND_Y, r: 0.6 + rng() * 1.6, p: rng() * 6.28 });
+  }
+}
+
+// --- game state ---------------------------------------------------------------
+function freshState() {
+  return {
+    t: 0, score: 0, lives: START_LIVES, over: false, overReason: '',
+    basketX: W / 2, basketV: 0, spawnIn: 0.4,
+    stars: [],          // {x, y, vy, sway, phase, caught}
+    bursts: [],         // {x, y, age, n}
+    flash: 0,           // red flash age after a miss
+    rng: mulberry32(1337),
+  };
+}
+
+function spawnStar(s) {
+  const r = s.rng;
+  s.stars.push({
+    x: 30 + r() * (W - 60),
+    y: -20,
+    vy: 150 + r() * 90 + s.t * 1.6,   // falls faster as the clock runs
+    sway: 20 + r() * 30,
+    phase: r() * 6.28,
+    rot: r() * 6.28,
+    rotV: (r() - 0.5) * 2,
+  });
+}
+
+// One fixed simulation step. `move` is -1, 0 or +1 (basket direction).
+function step(s, dt, move) {
+  if (s.over) return;
+  s.t += dt;
+  if (s.t >= GAME_LEN) { s.over = true; s.overReason = "TIME'S UP!"; return; }
+
+  // basket
+  const SPEED = 420;
+  s.basketX += move * SPEED * dt;
+  s.basketX = Math.max(BASKET_W / 2, Math.min(W - BASKET_W / 2, s.basketX));
+
+  // spawn
+  s.spawnIn -= dt;
+  if (s.spawnIn <= 0) { spawnStar(s); s.spawnIn = SPAWN_EVERY; }
+
+  // stars
+  for (let i = s.stars.length - 1; i >= 0; i--) {
+    const st = s.stars[i];
+    st.y += st.vy * dt;
+    st.x += Math.sin(s.t * 2 + st.phase) * st.sway * dt;
+    st.rot += st.rotV * dt;
+    // caught?
+    if (st.y + STAR_R >= BASKET_Y - 6 && st.y < BASKET_Y + BASKET_H &&
+        Math.abs(st.x - s.basketX) < BASKET_W / 2 + 8) {
+      s.score++;
+      s.bursts.push({ x: st.x, y: BASKET_Y - 10, age: 0 });
+      s.stars.splice(i, 1);
+      continue;
+    }
+    // hit the ground?
+    if (st.y - STAR_R >= GROUND_Y) {
+      s.stars.splice(i, 1);
+      s.lives--;
+      s.flash = 0.35;
+      if (s.lives <= 0) { s.over = true; s.overReason = 'OUT OF LIVES!'; return; }
+    }
+  }
+
+  // bursts + flash age
+  for (let i = s.bursts.length - 1; i >= 0; i--) {
+    s.bursts[i].age += dt;
+    if (s.bursts[i].age > 0.5) s.bursts.splice(i, 1);
+  }
+  if (s.flash > 0) s.flash -= dt;
+}
+
+// Autoplay: steer the basket toward the lowest falling star.
+function autoMove(s) {
+  let best = null;
+  for (const st of s.stars) if (!best || st.y > best.y) best = st;
+  if (!best) return 0;
+  const d = best.x - s.basketX;
+  return Math.abs(d) < 6 ? 0 : (d > 0 ? 1 : -1);
+}
+
+// Simulate from the start up to time `t` (demo mode).
+function stateAt(t) {
+  const s = freshState();
+  const dt = 1 / 60;
+  while (s.t < t && !s.over) step(s, dt, autoMove(s));
+  return s;
+}
+
+// --- drawing ------------------------------------------------------------------
+function drawStarShape(x, y, r, rot) {
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const rr = i % 2 === 0 ? r : r * 0.45;
+    const a = rot + (i * Math.PI) / 5 - Math.PI / 2;
+    const px = x + Math.cos(a) * rr, py = y + Math.sin(a) * rr;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+}
+
+function drawHeart(x, y, r, fill) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(r / 10, r / 10);
+  ctx.beginPath();
+  ctx.moveTo(0, 3);
+  ctx.bezierCurveTo(-11, -6, -5, -13, 0, -6);
+  ctx.bezierCurveTo(5, -13, 11, -6, 0, 3);
+  ctx.closePath();
+  ctx.fillStyle = fill;
+  ctx.fill();
+  ctx.restore();
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function draw(s) {
+  // sky
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#160b2e');
+  sky.addColorStop(0.55, '#2a1250');
+  sky.addColorStop(0.85, '#4a1d5e');
+  sky.addColorStop(1, '#0b0714');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, H);
+
+  // moon
+  ctx.fillStyle = '#f5edd6';
+  ctx.beginPath(); ctx.arc(452, 96, 42, 0, 6.29); ctx.fill();
+  ctx.fillStyle = '#e3d5ae';
+  ctx.beginPath(); ctx.arc(438, 84, 9, 0, 6.29); ctx.fill();
+  ctx.beginPath(); ctx.arc(464, 110, 6, 0, 6.29); ctx.fill();
+
+  // twinkling background stars
+  for (const b of bgStars) {
+    const tw = 0.45 + 0.55 * Math.abs(Math.sin(s.t * 1.4 + b.p));
+    ctx.fillStyle = 'rgba(255,255,255,' + tw.toFixed(2) + ')';
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, 6.29); ctx.fill();
+  }
+
+  // distant hills
+  ctx.fillStyle = '#1c0f33';
+  ctx.beginPath();
+  ctx.moveTo(0, GROUND_Y); ctx.quadraticCurveTo(140, 800, 300, GROUND_Y);
+  ctx.quadraticCurveTo(430, 830, W, GROUND_Y); ctx.lineTo(W, H); ctx.lineTo(0, H);
+  ctx.closePath(); ctx.fill();
+
+  // ground
+  ctx.fillStyle = '#241536';
+  ctx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
+  ctx.fillStyle = '#3a2560';
+  ctx.fillRect(0, GROUND_Y, W, 4);
+
+  // falling stars
+  for (const st of s.stars) {
+    ctx.save();
+    ctx.shadowColor = '#ffd94d'; ctx.shadowBlur = 18;
+    ctx.fillStyle = '#ffd94d';
+    drawStarShape(st.x, st.y, STAR_R, st.rot);
+    ctx.fill();
+    ctx.restore();
+    ctx.fillStyle = '#fff6c9';
+    drawStarShape(st.x, st.y, STAR_R * 0.45, st.rot);
+    ctx.fill();
+  }
+
+  // catch bursts
+  for (const b of s.bursts) {
+    const k = 1 - b.age / 0.5;
+    ctx.strokeStyle = 'rgba(255,217,77,' + k.toFixed(2) + ')';
+    ctx.lineWidth = 3;
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * 6.28;
+      const r0 = 8 + (1 - k) * 26;
+      ctx.beginPath();
+      ctx.moveTo(b.x + Math.cos(a) * r0, b.y + Math.sin(a) * r0);
+      ctx.lineTo(b.x + Math.cos(a) * (r0 + 10), b.y + Math.sin(a) * (r0 + 10));
+      ctx.stroke();
+    }
+  }
+
+  // basket
+  const bx = s.basketX - BASKET_W / 2;
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.5)'; ctx.shadowBlur = 12; ctx.shadowOffsetY = 4;
+  ctx.fillStyle = '#b4713a';
+  roundRect(bx, BASKET_Y, BASKET_W, BASKET_H, 8);
+  ctx.fill();
+  ctx.restore();
+  ctx.fillStyle = '#8a5426';
+  for (let i = 1; i < 4; i++) {
+    ctx.fillRect(bx + (BASKET_W / 4) * i - 2, BASKET_Y + 4, 4, BASKET_H - 8);
+  }
+  ctx.fillStyle = '#d99a55';
+  roundRect(bx - 6, BASKET_Y - 6, BASKET_W + 12, 12, 6);
+  ctx.fill();
+
+  // miss flash
+  if (s.flash > 0) {
+    ctx.fillStyle = 'rgba(255,60,60,' + (s.flash * 0.9).toFixed(2) + ')';
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // HUD
+  ctx.fillStyle = 'rgba(11,7,20,0.55)';
+  roundRect(16, 16, W - 32, 64, 12); ctx.fill();
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 26px system-ui, sans-serif';
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  ctx.fillText('SCORE  ' + s.score, 32, 48);
+  ctx.textAlign = 'center';
+  const left = Math.max(0, GAME_LEN - s.t);
+  const mm = Math.floor(left / 60), ss = Math.floor(left % 60);
+  ctx.fillText(mm + ':' + String(ss).padStart(2, '0'), W / 2, 48);
+  ctx.textAlign = 'right';
+  for (let i = 0; i < START_LIVES; i++) {
+    drawHeart(W - 40 - i * 34, 48, 13, i < s.lives ? '#ff5d73' : 'rgba(255,255,255,0.18)');
+  }
+
+  // title / help line
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.font = 'bold 30px system-ui, sans-serif';
+  ctx.fillText('STAR CATCHER', W / 2, 118);
+  ctx.font = '17px system-ui, sans-serif';
+  ctx.fillStyle = 'rgba(255,255,255,0.6)';
+  ctx.fillText('Catch the falling stars — don\'t let 3 hit the ground!', W / 2, 148);
+
+  // game over
+  if (s.over) {
+    ctx.fillStyle = 'rgba(11,7,20,0.72)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#ffd94d';
+    ctx.font = 'bold 44px system-ui, sans-serif';
+    ctx.fillText(s.overReason, W / 2, 400);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 34px system-ui, sans-serif';
+    ctx.fillText('SCORE  ' + s.score, W / 2, 470);
+    ctx.font = '20px system-ui, sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.fillText('Press R (or tap) to play again', W / 2, 530);
+  }
+}
+
+// --- live play ------------------------------------------------------------------
+const params = new URLSearchParams(location.search);
+const demoT = params.get('demo') === '1' ? parseFloat(params.get('t') || '0') : null;
+
+if (demoT !== null) {
+  // Demo mode: one deterministic frame, no loop.
+  draw(stateAt(Math.max(0, Math.min(GAME_LEN, demoT))));
+} else {
+  const live = freshState();
+  let keys = { left: false, right: false };
+  let last = performance.now();
+
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    if (!live.over) {
+      const move = (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
+      step(live, dt, move);
+    }
+    draw(live);
+    requestAnimationFrame(frame);
+  }
+
+  addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A') keys.left = true;
+    if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') keys.right = true;
+    if ((e.key === 'r' || e.key === 'R') && live.over) location.reload();
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') e.preventDefault();
+  });
+  addEventListener('keyup', (e) => {
+    if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A') keys.left = false;
+    if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') keys.right = false;
+  });
+
+  function pointerToX(e) {
+    const r = canvas.getBoundingClientRect();
+    const cx = (e.touches ? e.touches[0].clientX : e.clientX);
+    return ((cx - r.left) / r.width) * W;
+  }
+  function onPointer(e) {
+    if (live.over) { location.reload(); return; }
+    live.basketX = Math.max(BASKET_W / 2, Math.min(W - BASKET_W / 2, pointerToX(e)));
+    e.preventDefault();
+  }
+  canvas.addEventListener('pointerdown', onPointer);
+  canvas.addEventListener('pointermove', (e) => { if (e.buttons) onPointer(e); });
+  canvas.addEventListener('touchmove', onPointer, { passive: false });
+
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>
